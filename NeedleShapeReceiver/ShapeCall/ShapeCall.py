@@ -12,6 +12,7 @@ from slicer.i18n import translate
 
 #Custom helper alignment.py
 from logic.alignment import NeedleAlignment
+from logic.curvature import NeedleCurvature
 
 # ==================================================
 # MODULE
@@ -66,6 +67,17 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
         self.layout.addWidget(alignBox)
         self.layout.addStretch(1)
 
+        self.curvatureButton = qt.QPushButton(
+            "Compute Curvature Table"
+        )
+
+        self.curvatureButton.connect(
+            "clicked(bool)",
+            self.onComputeCurvature
+        )
+
+        alignLayout.addRow(self.curvatureButton)
+
         # ---------------- STATE ----------------
         self.latestNeedle = None
         self.lastUpdate = 0
@@ -76,6 +88,9 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
             ds=1.0,
             eps=1e-6,
             catheter_first_point_is_base=False
+        )
+        self.curvatureCalculator = NeedleCurvature(
+            curv_smooth_window=7
         )
 
         self.startROS()
@@ -223,3 +238,93 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
             self.statusLabel.setText(str(e))
 
             slicer.util.errorDisplay(str(e))
+    def onComputeCurvature(self):
+
+        try:
+
+            needleNode = self.needleFid
+
+            if needleNode is None:
+                raise RuntimeError(
+                    "NeedleFiducials missing"
+                )
+
+            pts = []
+
+            for i in range(
+                needleNode.GetNumberOfControlPoints()
+            ):
+
+                p = [0, 0, 0]
+
+                needleNode.GetNthControlPointPositionWorld(
+                    i,
+                    p
+                )
+
+                pts.append(p)
+
+            result = (
+                self.curvatureCalculator.compute_curvature(
+                    pts
+                )
+            )
+
+            s = result["arclength"]
+            k = result["curvature"]
+            t = result["tangent"]
+
+            tableNode = (
+                slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLTableNode",
+                    "NeedleCurvatureTable"
+                )
+            )
+
+            table = tableNode.GetTable()
+
+            arr_s = vtk.vtkDoubleArray()
+            arr_s.SetName("s")
+
+            arr_k = vtk.vtkDoubleArray()
+            arr_k.SetName("curvature")
+
+            arr_tx = vtk.vtkDoubleArray()
+            arr_tx.SetName("tx")
+
+            arr_ty = vtk.vtkDoubleArray()
+            arr_ty.SetName("ty")
+
+            arr_tz = vtk.vtkDoubleArray()
+            arr_tz.SetName("tz")
+
+            for i in range(len(s)):
+
+                arr_s.InsertNextValue(s[i])
+
+                arr_k.InsertNextValue(k[i])
+
+                arr_tx.InsertNextValue(t[i, 0])
+
+                arr_ty.InsertNextValue(t[i, 1])
+
+                arr_tz.InsertNextValue(t[i, 2])
+
+            table.AddColumn(arr_s)
+            table.AddColumn(arr_k)
+
+            table.AddColumn(arr_tx)
+            table.AddColumn(arr_ty)
+            table.AddColumn(arr_tz)
+
+            self.statusLabel.setText(
+                "Curvature table created"
+            )
+
+        except Exception as e:
+
+            logging.exception(e)
+
+            slicer.util.errorDisplay(str(e))
+
+            self.statusLabel.setText(str(e))
