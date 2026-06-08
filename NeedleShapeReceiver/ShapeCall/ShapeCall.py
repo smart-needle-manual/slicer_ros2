@@ -1,4 +1,9 @@
 import logging
+import os
+import csv
+import re
+import json
+import subprocess
 import qt
 import slicer
 import vtk
@@ -10,7 +15,6 @@ from slicer.i18n import tr as _
 from slicer.i18n import translate
 
 from logic_games.alignment import NeedleAlignment
-from logic_games.curvature import NeedleCurvature
 from logic_games.depth_state import NeedleDepthState
 
 
@@ -37,141 +41,215 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
         ScriptedLoadableModuleWidget.setup(self)
 
         # ---------------- UI ----------------
-        self.statusLabel = qt.QLabel("Ready")
+        self.statusLabel    = qt.QLabel("Ready")
         self.numPointsLabel = qt.QLabel("0")
         self.lastPointLabel = qt.QLabel("N/A")
 
-        info = qt.QGroupBox("Needle Info")
+        info   = qt.QGroupBox("Needle Info")
         layout = qt.QFormLayout(info)
         layout.addRow("Points:", self.numPointsLabel)
-        layout.addRow("Last:", self.lastPointLabel)
+        layout.addRow("Last:",   self.lastPointLabel)
         layout.addRow("Status:", self.statusLabel)
-
         self.layout.addWidget(info)
 
-        # ---------------- NODE SELECTOR ----------------
-        self.catheterSelector = slicer.qMRMLNodeComboBox()
-        self.catheterSelector.nodeTypes = ["vtkMRMLMarkupsFiducialNode"]
-        self.catheterSelector.setMRMLScene(slicer.mrmlScene)
-        self.catheterSelector.noneEnabled = False
+        # ---------------- BUTTONS ----------------
+        self.alignButton      = qt.QPushButton("Align")
+        self.saveShapeButton  = qt.QPushButton("Save Shape")
+        self.resetAlignButton = qt.QPushButton("Reset Alignment")
+        self.exportButton     = qt.QPushButton("Export .needle")
 
-        # ---------------- ALIGN BUTTON ----------------
-        self.alignButton = qt.QPushButton("Align (Full Base/Tip Model)")
-        self.alignButton.connect("clicked(bool)", self.onAlign)
+        self.alignButton.connect("clicked(bool)",      self.onAlign)
+        self.saveShapeButton.connect("clicked(bool)",  self.onSaveShape)
+        self.resetAlignButton.connect("clicked(bool)", self.onResetAlignment)
+        self.exportButton.connect("clicked(bool)",     self.onExportNeedle)
 
-        alignBox = qt.QGroupBox("Alignment")
-        alignLayout = qt.QFormLayout(alignBox)
-        alignLayout.addRow("Catheter:", self.catheterSelector)
-        alignLayout.addRow(self.alignButton)
-
+        alignBox    = qt.QGroupBox("Alignment")
+        alignLayout = qt.QVBoxLayout(alignBox)
+        alignLayout.addWidget(self.alignButton)
+        alignLayout.addWidget(self.saveShapeButton)
+        alignLayout.addWidget(self.resetAlignButton)
+        alignLayout.addWidget(self.exportButton)
         self.layout.addWidget(alignBox)
+
+        # ---------------- CURVATURE SOURCE ----------------
+        self.csvPathEdit       = qt.QLineEdit("/home/obgynbrachy/MATLAB_dosimetry/needle_poses.csv")
+        self.needleIdCombo     = qt.QComboBox()
+        self.loadCsvButton     = qt.QPushButton("Load CSV")
+        self.publishCurvButton = qt.QPushButton("Publish Curvatures (External)")
+        self.revertFbgButton   = qt.QPushButton("Revert to FBG")
+
+        self.loadCsvButton.connect("clicked(bool)",     self.onLoadCurvatureCSV)
+        self.publishCurvButton.connect("clicked(bool)", self.onPublishCurvaturesExt)
+        self.revertFbgButton.connect("clicked(bool)",   self.onRevertToFBG)
+
+        curvBox    = qt.QGroupBox("Curvature Source")
+        curvLayout = qt.QFormLayout(curvBox)
+        curvLayout.addRow("CSV file:",  self.csvPathEdit)
+        curvLayout.addRow("Needle ID:", self.needleIdCombo)
+        curvLayout.addRow(self.loadCsvButton)
+        curvLayout.addRow(self.publishCurvButton)
+        curvLayout.addRow(self.revertFbgButton)
+        self.layout.addWidget(curvBox)
+
         self.layout.addStretch(1)
 
-        self.curvatureButton = qt.QPushButton("Compute Curvature Table")
-        self.curvatureButton.connect("clicked(bool)", self.onComputeCurvature)
-        alignLayout.addRow(self.curvatureButton)
-
         # ---------------- STATE ----------------
-        self.latestNeedle = None        # raw body-frame points (mm)
-        self.alignTransform = None      # vtkLandmarkTransform (body -> world)
-        self.alignmentDepth = 0.0       # insertion_depth at alignment time (mm)
-        self.insertionAxisWorld = None  # unit insertion axis in world frame
-        self.lastUpdate = 0
-        self.throttle = 0.15
+        # latestBodyPts  : raw body-frame points from last PoseArray, in mm
+        #                  (bridge ×1000 undone by dividing at read time)
+        # _latestWorldPts: body-frame points after alignment transform (mm).
+        #                  In alignment-time world coords — depth offset is NOT
+        #                  baked in. NeedleInsertionTransform moves both
+        #                  NeedleCurveModel and NeedleFiducials live.
+        self.latestBodyPts   = None   # (N,3) float64, mm, body frame
+        self._latestWorldPts = None   # (N,3) float64, mm, alignment-time world frame
+
+        # _alignMatrix: 4×4 numpy matrix extracted ONCE in onAlign().
+        # Guards onDepth — transform only fires after alignment is complete.
+        self._alignMatrix       = None   # np (4,4)
+        self.alignmentDepth     = 0.0    # raw ROS depth at alignment time (mm)
+        self.insertionAxisWorld = None   # unit vector, world frame, insertion direction
+        #                                 NOTE: assumed to be in Slicer RAS (mm) frame,
+        #                                 matching the frame in which csv_base is expressed.
+
+        self._lastDepthPublishTime = 0.0
+        self._renderPending        = False
 
         self.depthState = NeedleDepthState()
+
+        self._curvRows = {}   # needle_id -> {'kx', 'ky', 'base', 'tangent'} from CSV
 
         self.aligner = NeedleAlignment(
             ds=1.0,
             eps=1e-6,
             catheter_first_point_is_base=False
         )
-        self.curvatureCalculator = NeedleCurvature(
-            curv_smooth_window=7
-        )
 
         self.pubNeedlePose = None
-        self.subShape = None
-        self.subDepth = None
-        self.needleFid = None
-        self.model = None
+        self.subShape      = None
+        self.subDepth      = None
+
+        self.needleFid              = None
+        self.model                  = None
         self.insertionTransformNode = None
+
+        self._vtkPts      = vtk.vtkPoints()
+        self._vtkPoly     = vtk.vtkPolyLine()
+        self._vtkCell     = vtk.vtkCellArray()
+        self._vtkPolyData = vtk.vtkPolyData()
+        self._vtkPolyData.SetPoints(self._vtkPts)
+        self._nPtsAllocated = 0
 
         self.startROS()
 
     # ==================================================
-    # ROS
+    # ROS SETUP
     # ==================================================
     def startROS(self):
 
         rosLogic = slicer.util.getModuleLogic('ROS2')
-        rosNode = rosLogic.GetDefaultROS2Node()
+        rosNode  = rosLogic.GetDefaultROS2Node()
 
         self.subShape = rosNode.CreateAndAddSubscriberNode(
             "PoseArray",
             "/needle/state/current_shape"
         )
-
         self.subDepth = rosNode.CreateAndAddSubscriberNode(
             "Double",
             "/needle/state/insertion_depth"
         )
-
-        # Publish to needle_pose_in — the TopicRepeater's input topic.
-        # The repeater (wait_for_input=True) wakes on the first message here
-        # and then continuously re-broadcasts to /stage/state/needle_pose.
-        # Nothing else publishes to needle_pose, so there is no competition.
         self.pubNeedlePose = rosNode.CreateAndAddPublisherNode(
             "PoseStamped",
-            "/stage/state/needle_pose_in"
+            "/stage/state/needle_pose"
         )
 
         self.needleFid = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLMarkupsFiducialNode",
-            "NeedleFiducials"
+            "vtkMRMLMarkupsFiducialNode", "NeedleFiducials"
         )
         self.needleFid.CreateDefaultDisplayNodes()
 
         self.model = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLModelNode",
-            "NeedleCurveModel"
+            "vtkMRMLModelNode", "NeedleCurveModel"
         )
         self.model.CreateDefaultDisplayNodes()
 
-        # Transform node that carries the cumulative insertion translation.
-        # Both needleFid and model observe it so Slicer handles the math.
+        # Both nodes observe NeedleInsertionTransform.
+        # Polydata and fiducial control points are written in alignment-time
+        # world coords; the transform translates them along the insertion axis
+        # as depth changes. Both nodes move together atomically.
         self.insertionTransformNode = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLLinearTransformNode",
-            "NeedleInsertionTransform"
+            "vtkMRMLLinearTransformNode", "NeedleInsertionTransform"
         )
-        self.needleFid.SetAndObserveTransformNodeID(
-            self.insertionTransformNode.GetID()
-        )
-        self.model.SetAndObserveTransformNodeID(
-            self.insertionTransformNode.GetID()
-        )
+        self.needleFid.SetAndObserveTransformNodeID(self.insertionTransformNode.GetID())
+        self.model.SetAndObserveTransformNodeID(self.insertionTransformNode.GetID())
 
-        self.subShape.AddObserver('ModifiedEvent', self.onROS)
+        self.subShape.AddObserver('ModifiedEvent', self.onShape)
+        self.subDepth.AddObserver('ModifiedEvent', self.onDepth)
 
-        # Publish needle_pose_in at 10 Hz so the TopicRepeater continuously
-        # receives the latest depth after alignment and re-broadcasts it.
-        # Before alignment depthState.state_initialized is False so nothing
-        # is sent — the one-shot seed in sim_needle.launch.py covers that gap.
         self._poseTimer = qt.QTimer()
-        self._poseTimer.setInterval(100)  # 100 ms = 10 Hz
+        self._poseTimer.setInterval(100)
         self._poseTimer.connect('timeout()', self._publishPoseTick)
         self._poseTimer.start()
 
-    # ==================================================
-    # FAST STREAM
-    # ==================================================
-    def onROS(self, caller=None, event=None):
+        self._renderTimer = qt.QTimer()
+        self._renderTimer.setInterval(50)   # 50 ms = 20 Hz
+        self._renderTimer.connect('timeout()', self._renderShape)
+        self._renderTimer.start()
 
-        now = time.time()
-        if now - self.lastUpdate < self.throttle:
+    # ==================================================
+    # DEPTH CALLBACK — primary pose publish path
+    # ==================================================
+    def onDepth(self, caller=None, event=None):
+        """
+        Fires on every new /needle/state/insertion_depth message (~20 Hz).
+
+        Guarded by _alignMatrix — transform only fires once alignment is
+        complete, preventing queued pre-alignment depth messages from
+        producing a burst jump on the first post-alignment tick.
+
+        Transform driven by raw ROS depth relative to alignmentDepth — not
+        by depthState's processed value — to avoid state variance accumulation.
+
+        Pose publish still requires state_initialized since depthState must
+        be fully set up before export_state() is valid.
+        """
+        if self._alignMatrix is None:
             return
-        self.lastUpdate = now
 
+        depthMsg = self.subDepth.GetLastMessage()
+        if depthMsg is None:
+            return
+
+        ros_depth_mm = float(depthMsg)
+
+        # Transform driven directly by raw ROS depth — authoritative for visualization.
+        depth_offset = ros_depth_mm - self.alignmentDepth
+        self._setInsertionTransform(depth_offset)
+
+        # Pose publish path — only once depthState is fully initialized.
+        if self.depthState.state_initialized:
+            self.depthState.insertion_depth = ros_depth_mm
+            self.depthState.update_pose_from_depth()
+            state = self.depthState.export_state()
+            self._publishPose(state)
+            self._lastDepthPublishTime = time.time()
+
+        # Always show raw ROS value — not depthState's processed value.
+        self.statusLabel.setText(f"Depth: {ros_depth_mm:.2f} mm")
+
+    # ==================================================
+    # SHAPE CALLBACK — data ingestion only
+    # ==================================================
+    def onShape(self, caller=None, event=None):
+        """
+        Fires on every ModifiedEvent on subShape (~20 Hz). Lightweight:
+        extracts points into numpy caches only. No VTK mutations.
+
+        Bridge applies ×1000 assuming ROS meters; SSN publishes mm.
+        Divide by 1000 at read time to recover true mm values.
+
+        worldPts are in alignment-time world coords — NeedleInsertionTransform
+        handles live translation of both NeedleCurveModel and NeedleFiducials.
+        """
         msg = self.subShape.GetLastMessage()
         if msg is None:
             return
@@ -180,70 +258,41 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
         if not poses:
             return
 
-        # --- Piece 1: ROS body-frame points, meters -> mm ---
-        bodyPts = []
-        for p in poses:
-            bodyPts.append([
-                p.GetElement(0, 3) / 1000.0,
-                p.GetElement(1, 3) / 1000.0,
-                p.GetElement(2, 3) / 1000.0,
-            ])
+        n = len(poses)
 
-        self.latestNeedle = np.array(bodyPts, dtype=float)
+        bodyPts = np.empty((n, 3), dtype=np.float64)
+        for i, p in enumerate(poses):
+            bodyPts[i, 0] = p.GetElement(0, 3) / 1000.0
+            bodyPts[i, 1] = p.GetElement(1, 3) / 1000.0
+            bodyPts[i, 2] = p.GetElement(2, 3) / 1000.0
 
-        # --- Piece 2: apply alignment transform to get world-frame points ---
-        if self.alignTransform is not None:
-            worldPts = self._apply_vtk_transform(
-                self.alignTransform,
-                self.latestNeedle
-            )
+        self.latestBodyPts = bodyPts
+
+        if self._alignMatrix is not None:
+            worldPts = self._applyAlignMatrix(bodyPts)
         else:
-            worldPts = self.latestNeedle
+            worldPts = bodyPts
 
-        # --- Piece 3: ROS insertion_depth drives transform and needle_pose ---
-        if self.depthState.state_initialized:
-            depthMsg = self.subDepth.GetLastMessage()
-            if depthMsg is not None:
-                ros_depth_mm = float(depthMsg)
-                self.depthState.insertion_depth = ros_depth_mm
-                self.depthState.update_pose_from_depth()
-                state = self.depthState.export_state()
-                self.publishNeedleState(state)
-                self.statusLabel.setText(
-                    f"Depth: {ros_depth_mm:.2f} mm"
-                )
+        self._latestWorldPts = worldPts
+        self._renderPending  = True
 
-            # Update the Slicer insertion transform with the cumulative
-            # depth offset since alignment. All visualization follows.
-            depth_offset = (
-                self.depthState.insertion_depth - self.alignmentDepth
-            )
-            self._set_insertion_transform(depth_offset)
-
-        # Write world-frame (alignment) points into the nodes once per frame.
-        # NeedleInsertionTransform carries all positional updates.
-        pts = vtk.vtkPoints()
-        poly = vtk.vtkPolyLine()
-        poly.GetPointIds().SetNumberOfIds(len(worldPts))
-
-        self.needleFid.RemoveAllControlPoints()
-
-        for i, pt in enumerate(worldPts):
-            pts.InsertNextPoint(pt[0], pt[1], pt[2])
-            poly.GetPointIds().SetId(i, i)
-            self.needleFid.AddControlPoint(pt[0], pt[1], pt[2])
-
-        cell = vtk.vtkCellArray()
-        cell.InsertNextCell(poly)
-
-        polyData = vtk.vtkPolyData()
-        polyData.SetPoints(pts)
-        polyData.SetLines(cell)
-
-        self.model.SetAndObservePolyData(polyData)
-
+    # ==================================================
+    # RENDER TIMER — VTK scene flush at display rate
+    # ==================================================
+    def _renderShape(self):
+        """
+        Render timer callback (20 Hz). Flushes _latestWorldPts to the VTK
+        scene if onShape has flagged new data since the last render.
+        Decouples ROS ModifiedEvent rate from VTK mutation rate.
+        """
+        if not self._renderPending or self._latestWorldPts is None:
+            return
+        self._renderPending = False
+        worldPts = self._latestWorldPts
+        self._updateModelPolyData(worldPts)
         self.numPointsLabel.setText(str(len(worldPts)))
-        self.lastPointLabel.setText(f"{worldPts[-1]}")
+        if len(worldPts) > 0:
+            self.lastPointLabel.setText(f"{worldPts[-1]}")
 
     # ==================================================
     # ALIGNMENT PIPELINE
@@ -252,68 +301,81 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
 
         try:
 
-            if self.latestNeedle is None:
-                raise RuntimeError("No needle data yet")
+            if self.latestBodyPts is None:
+                raise RuntimeError("No needle data yet — wait for /needle/state/current_shape")
 
-            needle_pts = self.latestNeedle
-            catNode = self.catheterSelector.currentNode()
+            needle_id = self.needleIdCombo.currentText
+            if not needle_id or needle_id not in self._curvRows:
+                raise RuntimeError("Load CSV and select a needle ID before aligning")
 
-            if catNode is None:
-                raise RuntimeError("Select catheter")
+            csv_base    = np.asarray(self._curvRows[needle_id]['base'],    dtype=np.float64)
+            csv_tan     = np.asarray(self._curvRows[needle_id]['tangent'], dtype=np.float64)
+            csv_tan_hat = csv_tan / np.linalg.norm(csv_tan)
 
-            cat_pts = []
-            for i in range(catNode.GetNumberOfControlPoints()):
-                p = [0, 0, 0]
-                catNode.GetNthControlPointPositionWorld(i, p)
-                cat_pts.append(p)
+            # Synthesise a 2-point world-frame reference from CSV so that
+            # aligner.align has a properly-scaled axis to register against.
+            # Arc-length of the current needle shape gives a realistic scale.
+            needle_pts = self.latestBodyPts
+            diffs      = np.diff(needle_pts, axis=0)
+            arc_length = float(np.sum(np.linalg.norm(diffs, axis=1)))
+            if arc_length < 1.0:
+                arc_length = 100.0   # safe fallback (mm) if shape is degenerate
 
-            cat_pts = np.asarray(cat_pts, dtype=float)
+            # Two-point reference: [tip, base] ordering matches
+            # catheter_first_point_is_base=False in the aligner.
+            ref_pts = np.array([
+                csv_base + csv_tan_hat * arc_length,   # [0] = tip  (far end)
+                csv_base,                              # [1] = base (skin entry)
+            ], dtype=np.float64)
 
-            if len(cat_pts) < 2:
-                raise RuntimeError("Catheter/reference list too small")
+            vtk_transform     = self.aligner.align(needle_pts, ref_pts)
+            self._alignMatrix = self._extractAlignMatrix(vtk_transform)
 
-            # Compute and store the alignment transform (body -> world).
-            vtk_transform = self.aligner.align(needle_pts, cat_pts)
-            self.alignTransform = vtk_transform
+            self.insertionAxisWorld = csv_tan_hat
+            skin_entry              = csv_base
 
-            ref_axis = (
-                np.asarray(cat_pts[-1], dtype=float)
-                - np.asarray(cat_pts[0], dtype=float)
+            logging.info(
+                f"onAlign: base/tangent from CSV needle_id='{needle_id}', "
+                f"arc_length={arc_length:.1f} mm"
             )
-
-            # Store normalized world-frame insertion axis for translation.
-            self.insertionAxisWorld = ref_axis / np.linalg.norm(ref_axis)
 
             if not self.depthState.state_initialized:
                 self.depthState.initialize_from_defaults(
-                    skin_entry=np.asarray(cat_pts[0], dtype=float),
-                    needle_pose_position=np.asarray(cat_pts[0], dtype=float),
-                    needle_pose_orientation=ref_axis,
+                    skin_entry=skin_entry,
+                    needle_pose_position=skin_entry,
+                    needle_pose_orientation=self.insertionAxisWorld,
                     insertion_depth=0.0,
                 )
 
-            # Set insertion_depth from fiducial arclength and reset the
-            # shape arclength baseline for post-alignment tracking.
             state = self.depthState.apply_alignment_measurement(
-                reference_pts=cat_pts,
-                updated_orientation=ref_axis,
+                reference_pts=ref_pts,
+                updated_orientation=self.insertionAxisWorld,
             )
 
-            # Seed alignmentDepth from the live ROS depth so depth_offset
-            # starts at zero on the first post-alignment frame. Fall back to
-            # fiducial arclength only if the topic has no message yet.
+            # Depth: authoritative starting value comes from the ROS side.
+            # Fall back to 0 — never bake in a stale depthState value.
             depthMsg = self.subDepth.GetLastMessage()
             if depthMsg is not None:
                 self.alignmentDepth = float(depthMsg)
+                logging.info(f"alignmentDepth seeded from ROS: {self.alignmentDepth:.2f} mm")
             else:
-                self.alignmentDepth = state["insertion_depth"]
+                self.alignmentDepth = 0.0
+                logging.warning("No depth message at alignment time — alignmentDepth set to 0")
 
-            # Reset the insertion transform to identity at alignment time.
-            self._set_insertion_transform(0.0)
+            # Reset transform to identity — both nodes start at alignment-time position.
+            self._setInsertionTransform(0.0)
 
-            self.publishNeedleState(state)
+            # Recompute worldPts immediately so model and fiducials are consistent.
+            freshWorldPts        = self._applyAlignMatrix(self.latestBodyPts)
+            self._latestWorldPts = freshWorldPts
+            self._renderPending  = True
+            self._seedNeedleFid(freshWorldPts)
+
+            self._publishPose(state)
+            self._lastDepthPublishTime = time.time()
+
             self.statusLabel.setText(
-                f"Alignment complete; depth={state['insertion_depth']:.2f} mm"
+                f"Aligned — CSV '{needle_id}' — depth={self.alignmentDepth:.2f} mm"
             )
 
         except Exception as e:
@@ -322,85 +384,414 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
             slicer.util.errorDisplay(str(e))
 
     # ==================================================
-    # CURVATURE
+    # SAVE SHAPE
     # ==================================================
-    def onComputeCurvature(self):
-
+    def onSaveShape(self):
+        """
+        Freeze the current NeedleFiducials state into a new static markups
+        node named <needle_id>_shape. Points are read via
+        GetNthControlPointPositionWorld so the depth offset from
+        NeedleInsertionTransform is baked in — reflecting true physical position.
+        The frozen node does NOT observe NeedleInsertionTransform and will
+        not move as depth changes subsequently.
+        If a node with the same name already exists it is silently replaced.
+        """
         try:
+            needle_id = self.needleIdCombo.currentText
+            if not needle_id:
+                raise RuntimeError("Select a needle ID before saving shape")
 
-            needleNode = self.needleFid
+            if self.needleFid is None:
+                raise RuntimeError("NeedleFiducials node missing — align first")
 
-            if needleNode is None:
-                raise RuntimeError("NeedleFiducials missing")
+            n = self.needleFid.GetNumberOfControlPoints()
+            if n == 0:
+                raise RuntimeError("NeedleFiducials is empty — align first")
 
-            pts = []
-            for i in range(needleNode.GetNumberOfControlPoints()):
-                p = [0, 0, 0]
-                needleNode.GetNthControlPointPositionWorld(i, p)
-                pts.append(p)
+            frozen_name = f"{needle_id}_shape"
 
-            result = self.curvatureCalculator.compute_curvature(pts)
+            # Remove any pre-existing node with this name.
+            existing = slicer.mrmlScene.GetFirstNodeByName(frozen_name)
+            if existing is not None:
+                slicer.mrmlScene.RemoveNode(existing)
+                logging.info(f"onSaveShape: replaced existing node '{frozen_name}'")
 
-            s = result["arclength"]
-            k = result["curvature"]
-            t = result["tangent"]
-
-            tableNode = slicer.mrmlScene.AddNewNodeByClass(
-                "vtkMRMLTableNode",
-                "NeedleCurvatureTable"
+            frozenNode = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode", frozen_name
             )
-            table = tableNode.GetTable()
+            frozenNode.CreateDefaultDisplayNodes()
+            # No transform applied — node stays fixed in world space permanently.
 
-            arr_s = vtk.vtkDoubleArray(); arr_s.SetName("s")
-            arr_k = vtk.vtkDoubleArray(); arr_k.SetName("curvature")
-            arr_tx = vtk.vtkDoubleArray(); arr_tx.SetName("tx")
-            arr_ty = vtk.vtkDoubleArray(); arr_ty.SetName("ty")
-            arr_tz = vtk.vtkDoubleArray(); arr_tz.SetName("tz")
+            for i in range(n):
+                p = [0.0, 0.0, 0.0]
+                self.needleFid.GetNthControlPointPositionWorld(i, p)
+                frozenNode.AddControlPoint(p[0], p[1], p[2])
 
-            for i in range(len(s)):
-                arr_s.InsertNextValue(s[i])
-                arr_k.InsertNextValue(k[i])
-                arr_tx.InsertNextValue(t[i, 0])
-                arr_ty.InsertNextValue(t[i, 1])
-                arr_tz.InsertNextValue(t[i, 2])
+            logging.info(f"onSaveShape: saved {n} points to '{frozen_name}'")
+            self.statusLabel.setText(f"Shape saved as '{frozen_name}' ({n} pts)")
 
-            table.AddColumn(arr_s)
-            table.AddColumn(arr_k)
-            table.AddColumn(arr_tx)
-            table.AddColumn(arr_ty)
-            table.AddColumn(arr_tz)
+        except Exception as e:
+            logging.exception(e)
+            self.statusLabel.setText(str(e))
+            slicer.util.errorDisplay(str(e))
 
-            self.statusLabel.setText("Curvature table created")
+    # ==================================================
+    # RESET ALIGNMENT
+    # ==================================================
+    def onResetAlignment(self):
+        """
+        Clear all alignment state so that onAlign must be re-run before
+        onDepth resumes driving NeedleInsertionTransform.
+        depthState is left intact — onAlign will call
+        apply_alignment_measurement again on the next alignment.
+        NeedleInsertionTransform is reset to identity so both
+        NeedleCurveModel and NeedleFiducials return to their
+        alignment-time positions until the next Align press.
+        """
+        self._alignMatrix       = None
+        self.insertionAxisWorld = None
+        self.alignmentDepth     = 0.0
+
+        self._setInsertionTransform(0.0)
+
+        logging.info("onResetAlignment: alignment state cleared")
+        self.statusLabel.setText("Alignment reset — select needle ID and press Align")
+
+    # ==================================================
+    # EXPORT .needle
+    # ==================================================
+    def onExportNeedle(self):
+        """
+        Resample NeedleFiducials at uniform ds=1.0 mm and write to
+        ~/MATLAB_dosimetry/<needle_id>.needle as a CSV with
+        header x_mm_, y_mm_, z_mm_.
+        Points are read via GetNthControlPointPositionWorld so the
+        current depth offset is baked in — true physical position.
+        """
+        try:
+            needle_id = self.needleIdCombo.currentText
+            if not needle_id:
+                raise RuntimeError("Select a needle ID before exporting")
+
+            if self.needleFid is None:
+                raise RuntimeError("NeedleFiducials node missing — align first")
+
+            n = self.needleFid.GetNumberOfControlPoints()
+            if n < 2:
+                raise RuntimeError("NeedleFiducials needs at least 2 points to export")
+
+            # Collect world-coord points (depth offset included).
+            pts = []
+            for i in range(n):
+                p = [0.0, 0.0, 0.0]
+                self.needleFid.GetNthControlPointPositionWorld(i, p)
+                pts.append(p)
+            pts = np.array(pts, dtype=np.float64)
+
+            # Cumulative arclength.
+            deltas         = np.diff(pts, axis=0)
+            segLengths     = np.linalg.norm(deltas, axis=1)
+            s              = np.concatenate([[0.0], np.cumsum(segLengths)])
+            totalLength    = s[-1]
+
+            # Resample at uniform ds=1.0 mm.
+            ds      = 1.0
+            sInterp = np.arange(0.0, totalLength + ds, ds)
+            xInterp = np.interp(sInterp, s, pts[:, 0])
+            yInterp = np.interp(sInterp, s, pts[:, 1])
+            zInterp = np.interp(sInterp, s, pts[:, 2])
+            ptsInterp = np.column_stack([xInterp, yInterp, zInterp])
+
+            # Write file.
+            outPath = os.path.expanduser(
+                f"~/MATLAB_dosimetry/{needle_id}.needle"
+            )
+            os.makedirs(os.path.dirname(outPath), exist_ok=True)
+
+            with open(outPath, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["x_mm_", "y_mm_", "z_mm_"])
+                for p in ptsInterp:
+                    writer.writerow(p)
+
+            logging.info(
+                f"onExportNeedle: wrote {len(ptsInterp)} pts "
+                f"(total {totalLength:.1f} mm) to {outPath}"
+            )
+            self.statusLabel.setText(
+                f"Exported '{needle_id}.needle' — "
+                f"{len(ptsInterp)} pts, {totalLength:.1f} mm"
+            )
+
+        except Exception as e:
+            logging.exception(e)
+            self.statusLabel.setText(str(e))
+            slicer.util.errorDisplay(str(e))
+
+    # ==================================================
+    # CURVATURE CSV
+    # ==================================================
+    def onLoadCurvatureCSV(self):
+        """
+        Read needle_poses.csv and populate the needle ID selector.
+        Detects curvature columns by name pattern Kx_aaN / Ky_aaN.
+        Also stores base position (base_x/y/z) and insertion tangent
+        (tan_x/y/z) for each row so that onAlign can consume them directly.
+        Both csv_base and csv_tan are assumed to be in Slicer RAS (mm) frame.
+        """
+        csvPath = self.csvPathEdit.text.strip()
+        if not os.path.isfile(csvPath):
+            slicer.util.errorDisplay(f"File not found:\n{csvPath}")
+            return
+        try:
+            self._curvRows = {}
+            with open(csvPath, newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames or []
+
+                kx_cols = sorted(
+                    [c for c in fieldnames if re.match(r'Kx_aa\d+', c, re.IGNORECASE)],
+                    key=lambda c: int(re.search(r'\d+', c).group())
+                )
+                ky_cols = sorted(
+                    [c for c in fieldnames if re.match(r'Ky_aa\d+', c, re.IGNORECASE)],
+                    key=lambda c: int(re.search(r'\d+', c).group())
+                )
+                if not kx_cols or not ky_cols:
+                    raise ValueError("No Kx_aaN / Ky_aaN columns found in CSV.")
+                if len(kx_cols) != len(ky_cols):
+                    raise ValueError(
+                        f"Mismatched curvature columns: {len(kx_cols)} Kx vs {len(ky_cols)} Ky."
+                    )
+
+                # Validate that pose columns are present.
+                required_pose_cols = {"base_x", "base_y", "base_z", "tan_x", "tan_y", "tan_z"}
+                missing = required_pose_cols - set(fieldnames)
+                if missing:
+                    raise ValueError(
+                        f"CSV is missing required pose columns: {sorted(missing)}"
+                    )
+
+                for row in reader:
+                    needle_id = row["needle_id"].strip()
+                    self._curvRows[needle_id] = {
+                        'kx':      [float(row[c]) for c in kx_cols],
+                        'ky':      [float(row[c]) for c in ky_cols],
+                        'base':    [float(row["base_x"]),
+                                    float(row["base_y"]),
+                                    float(row["base_z"])],
+                        'tangent': [float(row["tan_x"]),
+                                    float(row["tan_y"]),
+                                    float(row["tan_z"])],
+                    }
+
+            self.needleIdCombo.clear()
+            for nid in self._curvRows:
+                self.needleIdCombo.addItem(nid)
+            self.statusLabel.setText(
+                f"Loaded {len(self._curvRows)} rows — {len(kx_cols)} AAs per row"
+            )
+        except Exception as e:
+            logging.exception(e)
+            slicer.util.errorDisplay(str(e))
+
+    def onPublishCurvaturesExt(self):
+        """
+        1. Call /needle/curvatures/use_external to latch external mode.
+        2. Publish one Float64MultiArray to /needle/state/curvatures_in.
+
+        Data layout: [Kx_AA1, Ky_AA1, Kx_AA2, Ky_AA2, ...] — matches the
+        ravel('F') convention that sub_curvatures_ext_callback expects on the
+        ROS side (reshape to (2, numAAs) order='F' recovers X-row, Y-row).
+        Re-press to update if the selected needle ID changes.
+        """
+        needle_id = self.needleIdCombo.currentText
+        if not needle_id or needle_id not in self._curvRows:
+            slicer.util.errorDisplay("Load CSV first and select a needle ID.")
+            return
+        try:
+            # Step 1 — latch mode switch
+            self._callTriggerService("/needle/curvatures/use_external")
+
+            # Step 2 — pack curvature data
+            kx   = self._curvRows[needle_id]['kx']
+            ky   = self._curvRows[needle_id]['ky']
+            data = []
+            for x, y in zip(kx, ky):
+                data.append(x)
+                data.append(y)
+
+            # Step 3 — publish via ros2 topic pub --once
+            msg_str = json.dumps({"data": data})
+            result  = self._ros2_cmd([
+                "topic", "pub", "--once",
+                "/needle/state/curvatures_in",
+                "std_msgs/msg/Float64MultiArray",
+                f"'{msg_str}'",
+            ])
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Topic publish failed:\n{result.stderr}"
+                )
+
+            self.statusLabel.setText(
+                f"Curvatures published: '{needle_id}' ({len(kx)} AAs) — external mode latched"
+            )
 
         except Exception as e:
             logging.exception(e)
             slicer.util.errorDisplay(str(e))
-            self.statusLabel.setText(str(e))
+
+    def onRevertToFBG(self):
+        """
+        Call /needle/curvatures/use_fbg to hand control back to the
+        FBG pipeline. Use after Slicer-driven curvature session ends,
+        or after an unclean disconnect.
+        """
+        try:
+            self._callTriggerService("/needle/curvatures/use_fbg")
+            self.statusLabel.setText("Curvature source reverted to FBG pipeline")
+        except Exception as e:
+            logging.exception(e)
+            slicer.util.errorDisplay(str(e))
+
+    # ==================================================
+    # KEEPALIVE TIMER
+    # ==================================================
+    def _publishPoseTick(self):
+        """
+        Keepalive: fires every 100 ms but publishes only if onDepth has been
+        silent for > 80 ms. Suppressed whenever onDepth is actively firing.
+        """
+        if not self.depthState.state_initialized:
+            return
+        if time.time() - self._lastDepthPublishTime < 0.08:
+            return
+        state = self.depthState.export_state()
+        self._publishPose(state)
 
     # ==================================================
     # HELPERS
     # ==================================================
-    def _apply_vtk_transform(self, transform, pts):
-        """Apply a vtkAbstractTransform to an (N,3) numpy array."""
-        out = np.zeros_like(pts)
-        for i, pt in enumerate(pts):
-            p_out = [0.0, 0.0, 0.0]
-            transform.TransformPoint(
-                [float(pt[0]), float(pt[1]), float(pt[2])],
-                p_out
+    def _seedNeedleFid(self, worldPts):
+        """
+        Write worldPts into NeedleFiducials at alignment time, in
+        alignment-time world coords. Called once by onAlign.
+        NeedleInsertionTransform then moves NeedleFiducials live
+        in sync with NeedleCurveModel as depth changes.
+        """
+        self.needleFid.RemoveAllControlPoints()
+        for pt in worldPts:
+            self.needleFid.AddControlPoint(float(pt[0]), float(pt[1]), float(pt[2]))
+
+    def _ros2_cmd(self, ros2_args):
+        """
+        Wrap a ros2 CLI invocation in a clean bash shell that sources the
+        ROS 2 setup before executing. This bypasses any PYTHONPATH/PYTHONHOME
+        conflicts introduced by Slicer's embedded Python environment.
+
+        ros2_args : list of str, e.g.
+            ['service', 'call', '/my/srv', 'std_srvs/srv/Trigger', '{}']
+        Returns a subprocess.CompletedProcess.
+        """
+        ros2_setup = "/opt/ros/humble/setup.bash"
+        cmd_str    = " ".join(ros2_args)
+        bash_cmd   = (
+            "unset PYTHONPATH PYTHONHOME PYTHONSTARTUP "
+            "PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE && "
+            f"source {ros2_setup} && "
+            f"ros2 {cmd_str}"
+        )
+        return subprocess.run(
+            ["bash", "-c", bash_cmd],
+            capture_output=True, text=True, timeout=10.0,
+        )
+
+    def _callTriggerService(self, service_name):
+        """
+        Call a std_srvs/srv/Trigger service via subprocess.
+        Sources /opt/ros/humble/setup.bash inside bash to ensure the ros2
+        CLI uses the system Python that ROS 2 was built against, not Slicer's.
+        Raises RuntimeError on non-zero exit or timeout.
+        """
+        result = self._ros2_cmd([
+            "service", "call",
+            service_name,
+            "std_srvs/srv/Trigger",
+            "'{}'",
+        ])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Service call to {service_name} failed:\n{result.stderr}"
             )
-            out[i] = p_out
-        return out
+        logging.info(f"Service {service_name}: {result.stdout.strip()}")
 
-    def _set_insertion_transform(self, depth_offset_mm):
-        """Update NeedleInsertionTransform with a translation along the
-        insertion axis by depth_offset_mm (mm, Slicer world frame)."""
-        if self.insertionTransformNode is None:
-            return
-        if self.insertionAxisWorld is None:
+    def _extractAlignMatrix(self, vtk_transform):
+        """
+        Extract a vtkAbstractTransform's 4×4 matrix into numpy.
+        Called ONCE at alignment time — never in any hot path.
+        """
+        m = vtk.vtkMatrix4x4()
+        vtk_transform.GetMatrix(m)
+        return np.array(
+            [[m.GetElement(i, j) for j in range(4)] for i in range(4)],
+            dtype=np.float64
+        )
+
+    def _applyAlignMatrix(self, pts):
+        """
+        Apply the cached (4,4) alignment matrix to an (N,3) point array.
+        Returns alignment-time world coords — depth offset NOT included.
+        NeedleInsertionTransform handles live translation of both nodes.
+        """
+        pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float64)])
+        return (self._alignMatrix @ pts_h.T).T[:, :3]
+
+    def _updateModelPolyData(self, worldPts):
+        """
+        Update model polydata in-place. VTK objects pre-allocated at setup();
+        only mutates contents and calls Modified().
+        """
+        n = len(worldPts)
+
+        if n != self._nPtsAllocated:
+            self._vtkPts.SetNumberOfPoints(n)
+            self._vtkPoly.GetPointIds().SetNumberOfIds(n)
+            for i in range(n):
+                self._vtkPoly.GetPointIds().SetId(i, i)
+            self._nPtsAllocated = n
+
+        for i in range(n):
+            self._vtkPts.SetPoint(
+                i,
+                float(worldPts[i, 0]),
+                float(worldPts[i, 1]),
+                float(worldPts[i, 2])
+            )
+
+        self._vtkPts.Modified()
+
+        self._vtkCell.Reset()
+        self._vtkCell.InsertNextCell(self._vtkPoly)
+
+        self._vtkPolyData.SetLines(self._vtkCell)
+        self._vtkPolyData.Modified()
+
+        if self.model.GetPolyData() is not self._vtkPolyData:
+            self.model.SetAndObservePolyData(self._vtkPolyData)
+
+    def _setInsertionTransform(self, depth_offset_mm):
+        """
+        Translate NeedleInsertionTransform by depth_offset_mm along insertionAxisWorld.
+        Both NeedleCurveModel and NeedleFiducials observe this node — Slicer
+        propagates the translation to both simultaneously.
+        Called by: onDepth (every depth message), onAlign (reset to 0),
+        onResetAlignment (reset to 0).
+        """
+        if self.insertionTransformNode is None or self.insertionAxisWorld is None:
             return
 
-        t = -depth_offset_mm * self.insertionAxisWorld
+        t = depth_offset_mm * self.insertionAxisWorld
 
         m = vtk.vtkMatrix4x4()
         m.Identity()
@@ -411,10 +802,14 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
         self.insertionTransformNode.SetMatrixTransformToParent(m)
 
     # ==================================================
-    # PUBLISH
+    # PUBLISH — single path
     # ==================================================
-    def publishNeedleState(self, state):
-
+    def _publishPose(self, state):
+        """
+        Sole publish function. Called by: onDepth, _publishPoseTick, onAlign.
+        Bridge divides by 1000 to produce ROS meters — pre-multiply by 1000
+        to express in bridge's expected Slicer units (mm).
+        """
         if self.pubNeedlePose is None:
             return
 
@@ -426,18 +821,8 @@ class ShapeCallWidget(ScriptedLoadableModuleWidget):
         pose_mat = pose_msg.GetPose()
         pose_mat.Identity()
 
-        # Internal units are mm; ROS expects meters, so multiply by 1000.
         pose_mat.SetElement(0, 3, float(pose_position[0]) * 1000.0)
         pose_mat.SetElement(1, 3, float(pose_position[1]) * 1000.0)
         pose_mat.SetElement(2, 3, float(pose_position[2]) * 1000.0)
 
         self.pubNeedlePose.Publish(pose_msg)
-
-    def _publishPoseTick(self):
-        """Timer callback: publish current needle pose at 10 Hz to needle_pose_in.
-        The TopicRepeater latches each value and re-broadcasts to needle_pose,
-        ensuring ShapeSensingNeedleNode always sees the latest depth."""
-        if not self.depthState.state_initialized:
-            return
-        state = self.depthState.export_state()
-        self.publishNeedleState(state)
